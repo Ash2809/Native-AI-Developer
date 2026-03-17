@@ -36,6 +36,10 @@ app.add_middleware(
 pipelines: Dict[str, Any] = {}
 
 
+class AgenState(TypedDict):
+    agent_name:str
+    agent_state:Optional[str]
+
 class DevState(TypedDict):
     raw_input:           str
     intent_manifest:     Optional[Dict]
