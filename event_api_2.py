@@ -1,6 +1,3 @@
-
-text
-
 import os
 import re
 import json
@@ -22,7 +19,7 @@ from langgraph.checkpoint.memory import MemorySaver
 load_dotenv()
 
 llm = ChatGoogleGenerativeAI(
-    model="gemini-2.0-flash",
+    model="gemini-3.1-flash-lite-preview",
     api_key=os.getenv("GEMINI_API_KEY"),
     temperature=0.1,
 )
@@ -89,7 +86,6 @@ class DevState(TypedDict):
     audit_log:           Annotated[List[Dict], operator.add]
     drift_alerts:        Optional[List]
     security_retries:    int
-    pipeline_stopped:    bool
 
 
 class RunRequest(BaseModel):
@@ -106,38 +102,50 @@ class HITLDecisionRequest(BaseModel):
     risk_acknowledged: Optional[bool] = False
 
 
-def extract_json(text) -> dict:
+def extract_json(text: str) -> dict:
     if hasattr(text, "text"):
         text = text.text
     if not isinstance(text, str):
         text = str(text)
+    
     text = re.sub(r"```(?:json)?", "", text).replace("```", "").strip()
+    
+    # try direct parse first
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
+    
+    # try finding outermost { } block
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
         raise ValueError(f"No JSON found in response:\n{text[:500]}")
+    
     try:
         return json.loads(match.group())
     except json.JSONDecodeError:
         pass
+    
+    # last resort — use raw_decode to get the first valid JSON object
     decoder = json.JSONDecoder()
     start   = text.find("{")
     if start == -1:
         raise ValueError(f"No JSON object found:\n{text[:500]}")
-    obj, _ = decoder.raw_decode(text, start)
-    return obj
+    try:
+        obj, _ = decoder.raw_decode(text, start)
+        return obj
+    except json.JSONDecodeError as e:
+        raise ValueError(f"JSON parse failed: {e}\nText preview:\n{text[:500]}")
 
 
 def make_audit_entry(agent: str, summary: str, data: dict) -> dict:
+
     return {
         "agent":     agent,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "summary":   summary,
         "data":      data,
-    }
+}
 
 
 def compute_hash(data) -> str:
@@ -282,6 +290,7 @@ EXPLAINABILITY_SCHEMA = '{"decision_log":[{"decision_point":"string","what_was_d
 
 
 def intent_agent(state: DevState) -> dict:
+    print(state["raw_input"])
     if should_stop(state):
         print("[intent_agent] pipeline stopped — skipping")
         return {}
@@ -444,57 +453,228 @@ Respond ONLY with valid JSON:
     }
 
 
-def run_local_security_scan(modules: list, ip_clearance: dict) -> list:
-    cleared_libs = {lib["name"].lower() for lib in ip_clearance.get("scanned_libraries", [])}
-    stdlib = {"os","sys","re","json","datetime","typing","pathlib","hashlib","hmac","secrets","logging","functools","itertools","collections","abc","enum","pydantic","starlette","asyncpg","sqlalchemy","alembic","pytest","httpx","uvicorn","fastapi"}
-    findings = []
+# def run_local_security_scan(modules: list, ip_clearance: dict) -> list:
+#     cleared_libs = {lib["name"].lower() for lib in ip_clearance.get("scanned_libraries", [])}
+#     stdlib = {"os","sys","re","json","datetime","typing","pathlib","hashlib","hmac","secrets","logging","functools","itertools","collections","abc","enum","pydantic","starlette","asyncpg","sqlalchemy","alembic","pytest","httpx","uvicorn","fastapi"}
+#     findings = []
+#     for module in modules:
+#         filename, code = module.get("filename", "unknown"), module.get("code", "")
+#         for rule_name, rule in SECURITY_RULES.items():
+#             if rule["pattern"] is None:
+#                 continue
+#             matches = re.findall(rule["pattern"], code, re.MULTILINE)
+#             if matches:
+#                 findings.append({"filename": filename, "rule": rule_name, "severity": rule["severity"], "owasp_ref": rule["owasp"], "line_hint": str(matches[0])[:120], "fix": rule["fix"], "source": "local_scan"})
+#         for imp in re.findall(r'^(?:import|from)\s+(\w+)', code, re.MULTILINE):
+#             if imp.lower() not in stdlib and imp.lower() not in cleared_libs:
+#                 findings.append({"filename": filename, "rule": "unlicensed_import", "severity": "high", "owasp_ref": "IP Compliance", "line_hint": f"import {imp}", "fix": f"'{imp}' not IP-cleared", "source": "local_scan"})
+#     return findings
+
+
+# def check_compliance_tag_coverage(modules: list) -> dict:
+#     files_with, files_without = [], []
+#     for module in modules:
+#         (files_with if re.search(r'#\s*\[(GDPR|OWASP|HIPAA|PCI)', module.get("code", "")) else files_without).append(module.get("filename", "unknown"))
+#     total = len(modules)
+#     return {"files_with_tags": len(files_with), "files_without_tags": files_without, "coverage_percent": round((len(files_with) / total * 100) if total > 0 else 0, 1)}
+
+
+# def security_agent(state: DevState) -> dict:
+#     if should_stop(state):
+#         print("[security_agent] pipeline stopped — skipping")
+#         return {}
+#     print("[security_agent] Starting")
+#     modules        = state["generated_code"].get("modules", [])
+#     ip_clearance   = state["ip_clearance"]
+#     local_findings = run_local_security_scan(modules, ip_clearance)
+#     tag_coverage   = check_compliance_tag_coverage(modules)
+#     code_dump      = "\n\n".join([f"### {m['filename']}\n{m['code']}" for m in modules])
+#     response       = llm.invoke(f"You are a senior application security engineer.\nCode:\n{code_dump}\nLocal findings: {json.dumps(local_findings)}\nIP Cleared: {json.dumps([lib['name'] for lib in ip_clearance.get('scanned_libraries', [])])}\nSet passed=true ONLY if zero critical findings.\nRespond ONLY with valid JSON:\n{SECURITY_SCHEMA}")
+#     report         = extract_json(response.text)
+#     existing_keys  = {(f["filename"], f["rule"]) for f in report.get("findings", [])}
+#     for lf in local_findings:
+#         if (lf["filename"], lf["rule"]) not in existing_keys:
+#             report.setdefault("findings", []).append(lf)
+#     report["compliance_tag_coverage"] = tag_coverage
+#     critical_count = sum(1 for f in report.get("findings", []) if f["severity"] == "critical")
+#     report["passed"] = critical_count == 0
+#     print(f"[security_agent] Done — risk: {report.get('overall_security_risk')}, passed: {report['passed']}, retries used: {state.get('security_retries', 0)}")
+#     return {
+#         "security_report": report,
+#         "audit_log": [make_audit_entry("security_agent", f"Security scan — risk: {report.get('overall_security_risk')} | passed: {report.get('passed')}", {"total_findings": len(report.get("findings", [])), "critical": critical_count, "passed": report.get("passed")})],
+#     }
+
+
+
+def run_local_security_scan(modules: list, ip_clearance: dict) -> dict:
+
+    local_findings = []
+    cleared_libs   = {
+        lib["name"].lower()
+        for lib in ip_clearance.get("scanned_libraries", [])
+    }
+
     for module in modules:
-        filename, code = module.get("filename", "unknown"), module.get("code", "")
+        filename = module.get("filename", "unknown")
+        code     = module.get("code", "")
+
         for rule_name, rule in SECURITY_RULES.items():
             if rule["pattern"] is None:
                 continue
             matches = re.findall(rule["pattern"], code, re.MULTILINE)
             if matches:
-                findings.append({"filename": filename, "rule": rule_name, "severity": rule["severity"], "owasp_ref": rule["owasp"], "line_hint": str(matches[0])[:120], "fix": rule["fix"], "source": "local_scan"})
-        for imp in re.findall(r'^(?:import|from)\s+(\w+)', code, re.MULTILINE):
-            if imp.lower() not in stdlib and imp.lower() not in cleared_libs:
-                findings.append({"filename": filename, "rule": "unlicensed_import", "severity": "high", "owasp_ref": "IP Compliance", "line_hint": f"import {imp}", "fix": f"'{imp}' not IP-cleared", "source": "local_scan"})
-    return findings
+                local_findings.append({
+                    "filename":  filename,
+                    "rule":      rule_name,
+                    "severity":  rule["severity"],
+                    "owasp_ref": rule["owasp"],
+                    "line_hint": str(matches[0])[:120],
+                    "fix":       rule["fix"],
+                    "source":    "local_scan",
+                })
+
+        imports = re.findall(r'^(?:import|from)\s+(\w+)', code, re.MULTILINE)
+        for imp in imports:
+            imp_lower = imp.lower()
+            stdlib = {
+                "os", "sys", "re", "json", "datetime", "typing",
+                "pathlib", "hashlib", "hmac", "secrets", "logging",
+                "functools", "itertools", "collections", "abc", "enum","pydantic", "starlette", "asyncpg", "sqlalchemy", "alembic", "pytest", "httpx", "uvicorn", "fastapi"
+            }
+            if imp_lower not in stdlib and imp_lower not in cleared_libs:
+                local_findings.append({
+                    "filename":  filename,
+                    "rule":      "unlicensed_import",
+                    "severity":  "high",
+                    "owasp_ref": "IP Compliance",
+                    "line_hint": f"import {imp}",
+                    "fix":       f"'{imp}' was not IP-cleared — verify license before use",
+                    "source":    "local_scan",
+                })
+
+    return local_findings
 
 
 def check_compliance_tag_coverage(modules: list) -> dict:
-    files_with, files_without = [], []
+    """Check every file has compliance inline comments."""
+    files_with    = []
+    files_without = []
+
     for module in modules:
-        (files_with if re.search(r'#\s*\[(GDPR|OWASP|HIPAA|PCI)', module.get("code", "")) else files_without).append(module.get("filename", "unknown"))
-    total = len(modules)
-    return {"files_with_tags": len(files_with), "files_without_tags": files_without, "coverage_percent": round((len(files_with) / total * 100) if total > 0 else 0, 1)}
+        code     = module.get("code", "")
+        filename = module.get("filename", "unknown")
+        has_tags = bool(re.search(r'#\s*\[(GDPR|OWASP|HIPAA|PCI)', code))
+        if has_tags:
+            files_with.append(filename)
+        else:
+            files_without.append(filename)
+
+    total    = len(modules)
+    coverage = round((len(files_with) / total * 100) if total > 0 else 0, 1)
+
+    return {
+        "files_with_tags":    len(files_with),
+        "files_without_tags": files_without,
+        "coverage_percent":   coverage,
+    }
 
 
 def security_agent(state: DevState) -> dict:
-    if should_stop(state):
-        print("[security_agent] pipeline stopped — skipping")
-        return {}
-    print("[security_agent] Starting")
-    modules        = state["generated_code"].get("modules", [])
-    ip_clearance   = state["ip_clearance"]
-    local_findings = run_local_security_scan(modules, ip_clearance)
-    tag_coverage   = check_compliance_tag_coverage(modules)
-    code_dump      = "\n\n".join([f"### {m['filename']}\n{m['code']}" for m in modules])
-    response       = llm.invoke(f"You are a senior application security engineer.\nCode:\n{code_dump}\nLocal findings: {json.dumps(local_findings)}\nIP Cleared: {json.dumps([lib['name'] for lib in ip_clearance.get('scanned_libraries', [])])}\nSet passed=true ONLY if zero critical findings.\nRespond ONLY with valid JSON:\n{SECURITY_SCHEMA}")
-    report         = extract_json(response.text)
-    existing_keys  = {(f["filename"], f["rule"]) for f in report.get("findings", [])}
+    code_state   = state["generated_code"]
+    ip_clearance = state["ip_clearance"]
+    modules      = code_state.get("modules", [])
+
+    local_findings       = run_local_security_scan(modules, ip_clearance)
+    tag_coverage         = check_compliance_tag_coverage(modules)
+
+    code_dump = "\n\n".join([
+        f"### {m['filename']}\n{m['code']}"
+        for m in modules
+    ])
+
+    prompt = f"""
+You are a senior application security engineer performing a code review.
+
+Review the following generated Python code for security vulnerabilities.
+
+Code:
+{code_dump}
+
+Local scan already detected these issues (include them in your findings):
+{json.dumps(local_findings, indent=2)}
+
+IP Cleared Libraries:
+{json.dumps([lib['name'] for lib in ip_clearance.get('scanned_libraries', [])], indent=2)}
+
+Compliance Tag Coverage:
+{json.dumps(tag_coverage, indent=2)}
+
+Check specifically for:
+1. Hardcoded secrets, keys, or passwords
+2. SQL injection vulnerabilities
+3. Missing authentication on protected routes
+4. Insecure JWT configuration (weak algo, no expiry)
+5. Missing input validation
+6. Debug mode enabled in production
+7. Any imports not in the IP-cleared list
+8. Missing or incorrect compliance inline comments
+9. Insecure cookie configuration
+10. Any other OWASP Top 10 violations
+
+Severity levels:
+- critical : exploitable immediately, must fix before deploy
+- high     : significant risk, should fix before deploy
+- medium   : moderate risk, fix soon
+- low      : minor issue, fix when possible
+
+Set "passed" to true ONLY if there are zero critical findings.
+
+Respond ONLY with valid JSON matching this schema, no explanation, no markdown:
+{SECURITY_SCHEMA}
+"""
+
+    response = llm.invoke(prompt)
+    report   = extract_json(response.text)
+
+    existing_keys = {
+        (f["filename"], f["rule"])
+        for f in report.get("findings", [])
+    }
     for lf in local_findings:
-        if (lf["filename"], lf["rule"]) not in existing_keys:
+        key = (lf["filename"], lf["rule"])
+        if key not in existing_keys:
             report.setdefault("findings", []).append(lf)
+
     report["compliance_tag_coverage"] = tag_coverage
-    critical_count = sum(1 for f in report.get("findings", []) if f["severity"] == "critical")
-    report["passed"] = critical_count == 0
-    print(f"[security_agent] Done — risk: {report.get('overall_security_risk')}, passed: {report['passed']}, retries used: {state.get('security_retries', 0)}")
+
+    findings        = report.get("findings", [])
+    critical_count  = sum(1 for f in findings if f["severity"] == "critical")
+    high_count      = sum(1 for f in findings if f["severity"] == "high")
+    passed          = report.get("passed", False)
+    overall_risk    = report.get("overall_security_risk", "unknown")
+
+    audit_entry = make_audit_entry(
+        agent   = "security_agent",
+        summary = (
+            f"Security scan complete — risk: {overall_risk} | "
+            f"findings: {len(findings)} "
+            f"(critical: {critical_count}, high: {high_count}) | "
+            f"passed: {passed}"
+        ),
+        data    = {
+            "total_findings":  len(findings),
+            "critical":        critical_count,
+            "high":            high_count,
+            "passed":          passed,
+            "overall_risk":    overall_risk,
+            "tag_coverage":    tag_coverage["coverage_percent"],
+        }
+    )
+
     return {
         "security_report": report,
-        "audit_log": [make_audit_entry("security_agent", f"Security scan — risk: {report.get('overall_security_risk')} | passed: {report.get('passed')}", {"total_findings": len(report.get("findings", [])), "critical": critical_count, "passed": report.get("passed")})],
+        "audit_log":       [audit_entry],
     }
-
 
 def explainability_agent(state: DevState) -> dict:
     if should_stop(state):
@@ -632,8 +812,10 @@ def route_after_hitl_1(state: DevState) -> str:
     decisions = state.get("hitl_decisions") or []
     gate1     = [d for d in decisions if d.get("gate") == "hitl_gate_1"]
     if gate1 and gate1[-1]["choice"] in ("R", "M"):
+        print("Fired Intent")
         result = "intent_agent"
     else:
+        print("Fired Compliance")
         result = "compliance_agent"
     print(f"[route_hitl_1] → {result}")
     return result
@@ -642,7 +824,8 @@ def route_after_hitl_1(state: DevState) -> str:
 def route_after_hitl_2(state: DevState) -> str:
     decisions = state.get("hitl_decisions") or []
     gate2     = [d for d in decisions if d.get("gate") == "hitl_gate_2"]
-    result    = "codegen_agent" if (gate2 and gate2[-1]["choice"] in ("A", "M")) else "architecture_agent"
+    result    = "codegen_agent" if (gate2 and gate2[-1]["choice"] in ("A")) else "architecture_agent"
+    print("THIS IS THE RESULT : ================>",result)
     print(f"[route_hitl_2] → {result}")
     return result
 
@@ -688,22 +871,64 @@ def passthrough_node(state: DevState) -> dict:
     return {}
 
 
+def intent_node(state: DevState) -> dict:
+    return intent_agent(state)
+
+def ip_guard_node(state: DevState) -> dict:
+    return ip_guard_agent(state)
+
+def hitl_1_node(state: DevState) -> dict:
+    return passthrough_node(state)
+
+def compliance_node(state: DevState) -> dict:
+    return compliance_agent(state)
+
+def architecture_node(state: DevState) -> dict:
+    return architecture_agent(state)
+
+def hitl_2_node(state: DevState) -> dict:
+    return passthrough_node(state)
+
+def codegen_node(state: DevState) -> dict:
+    return codegen_agent(state)
+
+def optimizer_node(state: DevState) -> dict:
+    return optimizer_agent(state)
+
+def security_node(state: DevState) -> dict:
+    return security_agent(state)
+
+def explainability_node(state: DevState) -> dict:
+    return explainability_agent(state)
+
+def quality_node(state: DevState) -> dict:
+    return quality_agent(state)
+
+def audit_node(state: DevState) -> dict:
+    return audit_agent(state)
+
+def hitl_3_node(state: DevState) -> dict:
+    return passthrough_node(state)
+
 def build_graph() -> StateGraph:
     graph = StateGraph(DevState)
-    graph.add_node("intent_agent",         intent_agent)
-    graph.add_node("ip_guard_agent",       ip_guard_agent)
-    graph.add_node("hitl_gate_1",          passthrough_node)
-    graph.add_node("compliance_agent",     compliance_agent)
-    graph.add_node("architecture_agent",   architecture_agent)
-    graph.add_node("hitl_gate_2",          passthrough_node)
-    graph.add_node("codegen_agent",        codegen_agent)
-    graph.add_node("optimizer_agent",      optimizer_agent)
-    graph.add_node("security_agent",       security_agent)
-    graph.add_node("explainability_agent", explainability_agent)
-    graph.add_node("quality_agent",        quality_agent)
-    graph.add_node("audit_agent",          audit_agent)
-    graph.add_node("hitl_gate_3",          passthrough_node)
+
+    graph.add_node("intent_agent",         intent_node)
+    graph.add_node("ip_guard_agent",       ip_guard_node)
+    graph.add_node("hitl_gate_1",          hitl_1_node)
+    graph.add_node("compliance_agent",     compliance_node)
+    graph.add_node("architecture_agent",   architecture_node)
+    graph.add_node("hitl_gate_2",          hitl_2_node)
+    graph.add_node("codegen_agent",        codegen_node)
+    graph.add_node("optimizer_agent",      optimizer_node)
+    graph.add_node("security_agent",       security_node)
+    graph.add_node("explainability_agent", explainability_node)
+    graph.add_node("quality_agent",        quality_node)
+    graph.add_node("audit_agent",          audit_node)
+    graph.add_node("hitl_gate_3",          hitl_3_node)
+
     graph.set_entry_point("intent_agent")
+
     graph.add_edge("intent_agent",         "ip_guard_agent")
     graph.add_edge("ip_guard_agent",       "hitl_gate_1")
     graph.add_edge("compliance_agent",     "architecture_agent")
@@ -713,11 +938,53 @@ def build_graph() -> StateGraph:
     graph.add_edge("explainability_agent", "quality_agent")
     graph.add_edge("quality_agent",        "audit_agent")
     graph.add_edge("audit_agent",          "hitl_gate_3")
-    graph.add_conditional_edges("hitl_gate_1",    route_after_hitl_1,  {"compliance_agent": "compliance_agent", "intent_agent": "intent_agent"})
-    graph.add_conditional_edges("hitl_gate_2",    route_after_hitl_2,  {"codegen_agent": "codegen_agent", "architecture_agent": "architecture_agent"})
-    graph.add_conditional_edges("security_agent", route_after_security, {"explainability_agent": "explainability_agent", "codegen_agent": "codegen_agent"})
-    graph.add_conditional_edges("quality_agent",  route_after_quality,  {"audit_agent": "audit_agent", "codegen_agent": "codegen_agent"})
-    graph.add_conditional_edges("hitl_gate_3",    route_after_hitl_3,  {END: END, "codegen_agent": "codegen_agent"})
+
+    graph.add_conditional_edges(
+        "hitl_gate_1",
+        route_after_hitl_1,
+        {
+            "compliance_agent": "compliance_agent",
+            "intent_agent":     "intent_agent",
+        }
+    )
+
+    graph.add_conditional_edges(
+        "hitl_gate_2",
+        route_after_hitl_2,
+        {
+            "codegen_agent":      "codegen_agent",
+            "architecture_agent": "architecture_agent",
+            "hitl_gate_2":        "hitl_gate_2",
+        }
+    )
+
+    graph.add_conditional_edges(
+        "security_agent",
+        route_after_security,
+        {
+            "explainability_agent": "explainability_agent",
+            "codegen_agent":        "codegen_agent",
+        }
+    )
+
+    graph.add_conditional_edges(
+        "quality_agent",
+        route_after_quality,
+        {
+            "audit_agent":   "audit_agent",
+            "codegen_agent": "codegen_agent",
+        }
+    )
+
+    graph.add_conditional_edges(
+        "hitl_gate_3",
+        route_after_hitl_3,
+        {
+            END:             END,
+            "codegen_agent": "codegen_agent",
+        }
+    )
+
     return graph
 
 
@@ -889,6 +1156,7 @@ async def start_pipeline(request: RunRequest):
 
 @app.post("/pipeline/{thread_id}/decide")
 async def hitl_decide(thread_id: str, request: HITLDecisionRequest):
+
     config = get_config(thread_id)
 
     if thread_id not in pipeline_queues:
@@ -927,15 +1195,16 @@ async def hitl_decide(thread_id: str, request: HITLDecisionRequest):
 
     # ── handle M at gate 1 — bake modification into raw_input ──────
     state_update: dict = {"hitl_decisions": existing_decisions + [decision], "audit_log": [audit_entry]}
-
-    if paused_at == "hitl_gate_1" and request.choice == "M" and request.extra_notes:
+    
+    if paused_at == "hitl_gate_1" and request.choice == "M" and request.feedback:
+        
         base_input  = re.sub(r'\n\n\[Human modification.*', '', current.values.get("raw_input", ""), flags=re.DOTALL).strip()
         state_update["raw_input"] = (
             f"{base_input}\n\n"
-            f"[IMPORTANT - Human modification]: {request.extra_notes}\n"
+            f"[IMPORTANT - Human modification]: {request.feedback}\n"
             f"You MUST follow this instruction exactly and override any previous tech stack decisions."
         )
-        print(f"[hitl_gate_1] Modification baked into raw_input: {request.extra_notes}")
+        print(f"[hitl_gate_1] Modification baked into raw_input: {request.feedback}")
 
     # ── handle gate 3 A/H — set pipeline_stopped ───────────────────
     if paused_at == "hitl_gate_3" and request.choice in ("A", "H"):
@@ -961,7 +1230,7 @@ async def hitl_decide(thread_id: str, request: HITLDecisionRequest):
         print(f"[{paused_at}] Resume event fired for thread: {thread_id}")
     else:
         print(f"[{paused_at}] WARNING: No resume event found for thread: {thread_id}")
-
+    
     return {
         "thread_id": thread_id,
         "gate":      paused_at,
