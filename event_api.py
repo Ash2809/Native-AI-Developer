@@ -17,6 +17,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_ollama import ChatOllama
 
+
 load_dotenv()
 
 llm = ChatGoogleGenerativeAI(
@@ -397,7 +398,7 @@ def codegen_agent(state: DevState) -> dict:
     arch       = state["architecture"]
     compliance = state["compliance_rules"]
     ip         = state["ip_clearance"]
-    response   = code_gen_llm.invoke(f"""You are a senior Python engineer generating complete end to end production-grade code.
+    response   = llm.invoke(f"""You are a senior Python engineer generating complete end to end production-grade code.
 Intent: {json.dumps(manifest)}
 Architecture: {arch.get('selected_pattern')}
 Layers: {json.dumps([l['name'] for l in arch.get('layers', [])])}
@@ -408,7 +409,7 @@ IP Cleared Libraries: {json.dumps([lib['name'] for lib in ip.get('scanned_librar
 CRITICAL: Use os.getenv() for ALL secrets. Add type hints. Add try/except. Add # [GDPR] / # [OWASP] inline comments. Add docstrings. Implement ALL acceptance criteria endpoints.
 Respond ONLY with valid JSON:
 {CODEGEN_SCHEMA}""")
-    code    = extract_json(response.content)
+    code    = extract_json(response.text)
     modules = code.get("modules", [])
     print(f"[codegen_agent] Done — {len(modules)} files generated: {[m['filename'] for m in modules]}")
     return {
